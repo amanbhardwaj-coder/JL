@@ -1,5 +1,4 @@
 # app.py
-# One Streamlit app: Convert inventory CSV to (1) Shopify format OR (2) Your internal VDB format
 # Run: streamlit run app.py
 
 import io
@@ -30,46 +29,190 @@ def safe_get(row, col):
         return np.nan
     return row.get(col, np.nan)
 
+def is_valid_image(url):
+    if not isinstance(url, str):
+        return False
+    u = url.strip().lower()
+    if not u.startswith("http"):
+        return False
+    return re.search(r"\.(jpg|jpeg|png|webp)(\?|$)", u) is not None
+
+def normalize_metal_for_option(metal: str) -> str:
+    m = metal.strip()
+    m = re.sub(r"\b(\d{2})\s*KT\b", r"\1Kt", m, flags=re.IGNORECASE)
+    m = re.sub(r"\b(\d{2})\s*K\b", r"\1K", m, flags=re.IGNORECASE)
+    return m
+
+def normalize_metal_for_tag(metal: str) -> str:
+    m = metal.strip()
+    m = re.sub(r"\b(\d{2})\s*KT\b", r"\1 Kt", m, flags=re.IGNORECASE)
+    m = re.sub(r"\b(\d{2})\s*K\b", r"\1 K", m, flags=re.IGNORECASE)
+    return m
+
+# --- category tag cleanup ---
+CATEGORY_TAGS = {
+    "ring","rings","engagement ring","engagement rings",
+    "necklace","necklaces",
+    "earring","earrings",
+    "bracelet","bracelets",
+    "pendant","pendants",
+    "bangle","bangles",
+}
+
+def type_to_allowed_categories(prod_type: str):
+    t = (prod_type or "").lower()
+    allowed = set()
+    if "ring" in t:
+        allowed.update(["ring","rings"])
+        if "engagement" in t:
+            allowed.update(["engagement ring","engagement rings"])
+    if "necklace" in t:
+        allowed.update(["necklace","necklaces"])
+    if "earring" in t:
+        allowed.update(["earring","earrings"])
+    if "bracelet" in t:
+        allowed.update(["bracelet","bracelets"])
+    if "pendant" in t:
+        allowed.update(["pendant","pendants"])
+    if "bangle" in t:
+        allowed.update(["bangle","bangles"])
+    return allowed
+
 # =========================================================
-# Shopify converter (your existing logic)
+# Styles from SAME file (NEW)
 # =========================================================
-def build_tags_from_master(master_row):
-    orig_tags = ""
-    if "Tags.1" in master_row and isinstance(master_row.get("Tags.1"), str):
-        orig_tags = master_row.get("Tags.1") or ""
-    elif "Tags" in master_row and isinstance(master_row.get("Tags"), str):
-        orig_tags = master_row.get("Tags") or ""
+STYLE_COLS = ["Style", "Style1", "Style2", "Style3"]
 
-    orig_tags = orig_tags.strip()
-    base_list = orig_tags.split(",") if orig_tags else []
-    base_list = [t for t in base_list if t != ""]
+def extract_styles_from_row(row) -> list[str]:
+    styles = []
+    for c in STYLE_COLS:
+        v = row.get(c)
+        if isinstance(v, str) and v.strip():
+            styles.append(v.strip())
+    # de-dupe keep order
+    out = []
+    seen = set()
+    for s in styles:
+        k = s.lower()
+        if k not in seen:
+            out.append(s)
+            seen.add(k)
+    return out
 
-    first_tag = base_list[0].strip() if base_list else ""
-    existing = {t.strip() for t in base_list}
-    extras = []
+def style_multiline(styles: list[str]):
+    return "\n".join(styles) if styles else np.nan
 
-    if first_tag:
-        pf_tag = f"Product Family_{first_tag.replace(' ', '_')}"
-        if pf_tag not in existing:
-            extras.append(pf_tag)
+# =========================================================
+# Shopify output builder
+# =========================================================
+def pick_type(master_row):
+    jc = master_row.get("Jewelry Classification")
+    if isinstance(jc, str) and jc.strip():
+        return jc.strip()
+    jt = master_row.get("Jewelry Type")
+    if isinstance(jt, str) and jt.strip():
+        return jt.strip()
+    return "Jewelry"
 
-    il_tag = "Item Location_United States"
-    if il_tag not in existing:
-        extras.append(il_tag)
+def build_body_html(master_row, styles: list[str]):
+    desc = master_row.get("Description")
+    desc_txt = str(desc).strip() if isinstance(desc, str) and desc.strip() else ""
 
-    master_stock_num = master_row.get("Stock Number")
-    if isinstance(master_stock_num, str) and master_stock_num:
-        vdb_tag = f"vdb_stock_num_{master_stock_num}"
-        if vdb_tag not in existing:
-            extras.append(vdb_tag)
+    side_clarity = master_row.get("Side Clarity")
+    side_color = master_row.get("Side Color")
 
-    combined = base_list + extras
-    if "vdbjl" not in {t.strip() for t in combined}:
-        combined.append("vdbjl")
+    details = []
 
-    return ",".join(combined) if combined else np.nan
+    # styles in Details (only if present)
+    for s in styles:
+        details.append(f"<p><strong>Style</strong> - {s}</p>")
+
+    if isinstance(side_clarity, str) and side_clarity.strip():
+        details.append(f"<p><strong>Side Stone Clarity</strong> - {side_clarity.strip()}</p>")
+
+    if isinstance(side_color, str) and side_color.strip():
+        details.append(f"<p><strong>Side Stone Color</strong> - {side_color.strip()}</p>")
+
+    out = []
+    if desc_txt:
+        out.append(f"<p>{desc_txt}</p>")
+    if details:
+        out.append("<hr><h3>Details</h3>" + "".join(details))
+
+    return "".join(out) if out else np.nan
+
+def build_tags(master_row, prod_type: str, styles: list[str], item_location="United States"):
+    tags = []
+
+    # keep existing tags in file
+    orig = master_row.get("Tags")
+    if isinstance(orig, str) and orig.strip():
+        tags.extend([t.strip() for t in orig.split(",") if t.strip()])
+
+    # --- remove WRONG category tags based on Type ---
+    allowed = type_to_allowed_categories(prod_type)
+    cleaned = []
+    for t in tags:
+        tl = t.lower().strip()
+        if tl in CATEGORY_TAGS and tl not in allowed:
+            continue
+        cleaned.append(t)
+    tags = cleaned
+
+    # --- add correct category tags (so collections work) ---
+    for cat in sorted(allowed):
+        if not any(x.lower().strip() == cat for x in tags):
+            tags.append(cat.title())
+
+    # ensure standard tags
+    if not any(t.lower().startswith("item location_") for t in tags):
+        tags.append(f"Item Location_{item_location}")
+
+    metal = master_row.get("Metal")
+    if isinstance(metal, str) and metal.strip():
+        if not any(t.lower().startswith("metal_") for t in tags):
+            tags.append(f"Metal_{normalize_metal_for_tag(metal)}")
+
+    sc = master_row.get("Side Clarity")
+    if isinstance(sc, str) and sc.strip():
+        if not any(t.lower().startswith("side stone clarity_") for t in tags):
+            tags.append(f"Side Stone Clarity_{sc.strip()}")
+
+    scol = master_row.get("Side Color")
+    if isinstance(scol, str) and scol.strip():
+        if not any(t.lower().startswith("side stone color_") for t in tags):
+            tags.append(f"Side Stone Color_{scol.strip()}")
+
+    jt = master_row.get("Jewelry Type")
+    if isinstance(jt, str) and jt.strip():
+        tags.append(f"Type_{jt.strip()}")
+
+    jc = master_row.get("Jewelry Classification")
+    if isinstance(jc, str) and jc.strip():
+        tags.append(f"Type_{jc.strip()}")
+
+    # add style tags only if present in file
+    for s in styles:
+        if not any(t.lower().strip() == s.lower() for t in tags):
+            tags.append(s)
+
+    # ensure VDBJL
+    if "VDBJL" not in {t.upper() for t in tags}:
+        tags.append("VDBJL")
+
+    # de-dupe (case-insensitive) keep order
+    out = []
+    seen = set()
+    for t in tags:
+        k = t.lower().strip()
+        if k not in seen:
+            out.append(t.strip())
+            seen.add(k)
+
+    return ", ".join(out) if out else np.nan
 
 def to_shopify_df(df: pd.DataFrame, vendor_name: str, item_location: str = "United States") -> pd.DataFrame:
+    # minimal Shopify columns (your exact base + Style metafield)
     shopify_cols = [
         "Handle","Title","Body (HTML)","Vendor","Product Category","Type","Tags","Published",
         "Option1 Name","Option1 Value","Option1 Linked To",
@@ -88,155 +231,108 @@ def to_shopify_df(df: pd.DataFrame, vendor_name: str, item_location: str = "Unit
         "Variant Image","Variant Weight Unit","Variant Tax Code","Cost per item","Status",
     ]
 
-    meta_base = "metafields_global_namespace_key[single_line_text].vdbjl."
-    metafield_cols = [
-        meta_base + "vdb_stock_id",
-        meta_base + "vdb_stock_num",
-        meta_base + "type",
-        meta_base + "metal",
-        meta_base + "item_location",
-        meta_base + "side_stone_color",
-        meta_base + "side_stone_clarity",
-        meta_base + "jewelry_classification",
-        meta_base + "shape",
-        meta_base + "weight",
-        meta_base + "available_diamond_spread",
-        meta_base + "available_metal_type",
-        meta_base + "available_shape",
-        meta_base + "customizable",
-    ]
-
-    all_cols = shopify_cols + metafield_cols
-    rows_out = []
-
-    required = ["Master Stock Number", "Stock Number"]
+    required = ["Master Stock Number", "Stock Number", "Metal", "Image URL 1"]
     missing = [c for c in required if c not in df.columns]
     if missing:
         raise ValueError(f"Missing required columns: {missing}")
 
-    for msn, group in df.groupby("Master Stock Number"):
+    rows_out = []
+
+    for msn, group in df.groupby("Master Stock Number", dropna=False):
         group = group.copy()
 
-        if "is_master_product" in group.columns and group["is_master_product"].any():
-            group = group.sort_values("is_master_product", ascending=False).reset_index(drop=True)
+        # master row
+        if "is_master_product" in group.columns and group["is_master_product"].fillna(False).any():
+            master = group.loc[group["is_master_product"].fillna(False)].iloc[0]
+            variants = group.loc[~group["is_master_product"].fillna(False)].copy()
         else:
-            group = group.reset_index(drop=True)
+            master = group.iloc[0]
+            variants = group.copy()
 
-        master = group.iloc[0]
+        if len(variants) == 0:
+            variants = pd.DataFrame([master])
 
-        short_title = master.get("Short Title")
-        stock_number_master = master.get("Stock Number")
+        # keep first SKU row as the “main” row
+        variants = variants.drop_duplicates(subset=["Stock Number"], keep="first").reset_index(drop=True)
+        first_variant = variants.iloc[0]
 
-        base_for_handle = short_title if isinstance(short_title, str) and short_title else stock_number_master
-        handle = slugify(base_for_handle)
+        # remove product if no valid primary image
+        if not is_valid_image(first_variant.get("Image URL 1")):
+            continue
 
-        title = short_title if isinstance(short_title, str) and short_title else stock_number_master
+        title = str(master.get("Master Stock Number")).strip()  # SKU as title
+        handle = slugify(title)
 
-        description = master.get("Description")
-        body_html = f"<p>{description}</p>" if isinstance(description, str) and description else np.nan
+        prod_type = pick_type(master)
+        styles = extract_styles_from_row(master)  # NEW: from same file
+        tags = build_tags(master, prod_type=prod_type, styles=styles, item_location=item_location)
+        body_html = build_body_html(master, styles)
 
-        prod_type = "Jewelry"
-        tags_str = build_tags_from_master(master)
+        metal = master.get("Metal")
+        metal_option = normalize_metal_for_option(metal) if isinstance(metal, str) and metal.strip() else np.nan
 
-        for idx, (_, row) in enumerate(group.iterrows()):
-            out = {c: np.nan for c in all_cols}
-            out["Handle"] = handle
+        # MAIN ROW
+        out = {c: np.nan for c in shopify_cols}
+        out["Handle"] = handle
+        out["Title"] = title
+        out["Body (HTML)"] = body_html
+        out["Vendor"] = vendor_name
+        out["Type"] = prod_type
+        out["Tags"] = tags
+        out["Published"] = True
 
-            if idx == 0:
-                out["Title"] = title
-                out["Body (HTML)"] = body_html
-                out["Vendor"] = vendor_name
-                out["Type"] = prod_type
-                out["Tags"] = tags_str
-                out["Published"] = True
-                out["Option1 Name"] = "Metal Type"
-                out["Option2 Name"] = "Available Diamond Spread"
-                out["Gift Card"] = False
-                out["Status"] = "active"
-            else:
-                out["Title"] = np.nan
-                out["Body (HTML)"] = np.nan
-                out["Published"] = np.nan
-                out["Status"] = np.nan
+        # Metal filter option
+        out["Option1 Name"] = "Metal Type"
+        out["Option1 Value"] = metal_option
 
-            out["Option3 Name"] = np.nan
-            out["Option3 Value"] = np.nan
-            out["Option3 Linked To"] = np.nan
+        out["Variant SKU"] = str(first_variant.get("Stock Number")).strip()
+        out["Variant Grams"] = 0
+        out["Variant Inventory Tracker"] = "shopify"
+        out["Variant Inventory Qty"] = 1
+        out["Variant Inventory Policy"] = "deny"
+        out["Variant Fulfillment Service"] = "manual"
 
-            out["Option1 Value"] = row.get("Metal")
-            out["Option2 Value"] = row.get("Diamond Spread")
+        price = first_variant.get("Price")
+        out["Variant Price"] = price
+        out["Cost per item"] = price
+        out["Variant Requires Shipping"] = True
+        out["Variant Taxable"] = True
+        out["Variant Weight Unit"] = "lb"
+        out["Gift Card"] = False
+        out["Status"] = "active"
 
-            out["Variant SKU"] = row.get("Stock Number")
-            out["Variant Grams"] = 0
-            out["Variant Inventory Tracker"] = "shopify"
-            out["Variant Inventory Qty"] = 1
-            out["Variant Inventory Policy"] = "deny"
-            out["Variant Fulfillment Service"] = "manual"
+        img1 = first_variant.get("Image URL 1")
+        out["Image Src"] = img1
+        out["Variant Image"] = img1
+        out["Image Position"] = 1
+        out["Image Alt Text"] = handle
 
-            price = row.get("Price")
-            out["Variant Price"] = price
-            out["Cost per item"] = price
+        # Style metafield ONLY if present in file
+        out["Style (product.metafields.custom.style)"] = style_multiline(styles)
 
-            out["Variant Requires Shipping"] = True
-            out["Variant Taxable"] = True
-            out["Variant Weight Unit"] = "lb"
+        rows_out.append(out)
 
-            img = row.get("Image URL 1")
-            if isinstance(img, str) and img:
-                out["Image Src"] = img
-                out["Variant Image"] = img
-                out["Image Position"] = idx + 1
+        # extra images as additional rows
+        pos = 2
+        for col in ["Image URL 2", "Image URL 3", "Image URL 4"]:
+            u = first_variant.get(col)
+            if is_valid_image(u):
+                rr = {c: np.nan for c in shopify_cols}
+                rr["Handle"] = handle
+                rr["Image Src"] = u
+                rr["Image Position"] = pos
+                rr["Image Alt Text"] = handle
+                rows_out.append(rr)
+                pos += 1
 
-                metal_slug = str(row.get("Metal") or "").strip().lower().replace(" ", "-")
-                spread = str(row.get("Diamond Spread") or "").strip()
-                alt_parts = []
-                if metal_slug:
-                    alt_parts.append(metal_slug)
-                if spread:
-                    alt_parts.append(spread)
-                if alt_parts:
-                    out["Image Alt Text"] = "-".join(alt_parts)
-
-            if idx == 0:
-                out[meta_base + "vdb_stock_id"] = np.nan
-                out[meta_base + "vdb_stock_num"] = stock_number_master
-                out[meta_base + "type"] = master.get("Jewelry Type")
-                out[meta_base + "metal"] = master.get("Metal")
-                out[meta_base + "item_location"] = item_location
-                out[meta_base + "side_stone_color"] = master.get("Side Color")
-                out[meta_base + "side_stone_clarity"] = master.get("Side Clarity")
-
-                out[meta_base + "jewelry_classification"] = master.get("Jewelry Classification")
-                out[meta_base + "shape"] = master.get("Shape")
-                out[meta_base + "weight"] = master.get("Weight")
-                out[meta_base + "available_diamond_spread"] = master.get("Available Diamond Spread")
-                out[meta_base + "available_metal_type"] = master.get("Available Metal Type")
-                out[meta_base + "available_shape"] = master.get("Available Shape")
-                out[meta_base + "customizable"] = master.get("Customizable")
-
-            rows_out.append(out)
-
-    return pd.DataFrame(rows_out, columns=all_cols)
+    return pd.DataFrame(rows_out, columns=shopify_cols)
 
 # =========================================================
-# VDB internal format converter (customizable mapping)
+# VDB internal format converter (unchanged)
 # =========================================================
 DEFAULT_VDB_OUTPUT_COLS = [
-    # Replace these with your true internal schema columns
-    "master_stock_number",
-    "stock_number",
-    "short_title",
-    "jewelry_type",
-    "metal",
-    "diamond_spread",
-    "price",
-    "image_url_1",
-    "side_color",
-    "side_clarity",
-    "shape",
-    "weight",
-    "customizable",
-    "vendor_name",
+    "master_stock_number","stock_number","short_title","jewelry_type","metal","diamond_spread","price",
+    "image_url_1","side_color","side_clarity","shape","weight","customizable","vendor_name",
 ]
 
 DEFAULT_VDB_MAPPING = {
@@ -279,7 +375,7 @@ st.caption("Upload your inventory CSV → choose output format (Shopify or VDB) 
 with st.sidebar:
     st.header("Vendor Info")
     vendor_name = st.text_input("Vendor Name", value="Perfect Love Inventory")
-    item_location = st.text_input("Item Location (Shopify metafield)", value="United States")
+    item_location = st.text_input("Item Location", value="United States")
     st.markdown("---")
     output_mode = st.selectbox("Select Output Format", ["Shopify format", "VDB format"], index=0)
 
@@ -302,17 +398,10 @@ if not vendor_name or not vendor_name.strip():
     st.warning("Please enter a Vendor Name in the sidebar.")
     st.stop()
 
-# -----------------------------
-# Shopify Mode
-# -----------------------------
 if output_mode == "Shopify format":
     if st.button("Convert", type="primary"):
         try:
-            out_df = to_shopify_df(
-                df_in,
-                vendor_name=vendor_name.strip(),
-                item_location=item_location.strip() or "United States",
-            )
+            out_df = to_shopify_df(df_in, vendor_name=vendor_name.strip(), item_location=item_location.strip() or "United States")
             out_bytes = df_to_csv_bytes(out_df)
 
             st.success(f"✅ Shopify CSV generated: {len(out_df):,} rows.")
@@ -320,20 +409,12 @@ if output_mode == "Shopify format":
             st.dataframe(out_df.head(25), use_container_width=True)
 
             base_name = uploaded_file.name.rsplit(".", 1)[0]
-            out_name = f"{base_name}_SHOPIFY_WITH_METAFIELDS.csv"
+            out_name = f"{base_name}_SHOPIFY.csv"
 
-            st.download_button(
-                "⬇️ Download Shopify CSV",
-                data=out_bytes,
-                file_name=out_name,
-                mime="text/csv",
-            )
+            st.download_button("⬇️ Download Shopify CSV", data=out_bytes, file_name=out_name, mime="text/csv")
         except Exception as e:
             st.error(f"Conversion failed: {e}")
 
-# -----------------------------
-# VDB Mode
-# -----------------------------
 else:
     st.subheader("VDB Format Configuration")
 
@@ -341,11 +422,7 @@ else:
     selectable_cols = ["__BLANK__", "__STATIC_VENDOR__"] + cols
 
     st.markdown("### Output columns (your internal schema)")
-    out_cols_text = st.text_area(
-        "One column per line",
-        value="\n".join(DEFAULT_VDB_OUTPUT_COLS),
-        height=220,
-    )
+    out_cols_text = st.text_area("One column per line", value="\n".join(DEFAULT_VDB_OUTPUT_COLS), height=220)
     output_cols = [c.strip() for c in out_cols_text.splitlines() if c.strip()]
 
     st.markdown("### Mapping (output → input)")
@@ -370,12 +447,7 @@ else:
     with c1:
         if st.button("Convert", type="primary"):
             try:
-                out_df = to_vdb_df(
-                    df_in,
-                    vendor_name=vendor_name.strip(),
-                    output_cols=output_cols,
-                    mapping=mapping,
-                )
+                out_df = to_vdb_df(df_in, vendor_name=vendor_name.strip(), output_cols=output_cols, mapping=mapping)
                 out_bytes = df_to_csv_bytes(out_df)
 
                 st.success(f"✅ VDB CSV generated: {len(out_df):,} rows.")
@@ -385,24 +457,14 @@ else:
                 base_name = uploaded_file.name.rsplit(".", 1)[0]
                 out_name = f"{base_name}_VDB_FORMAT.csv"
 
-                st.download_button(
-                    "⬇️ Download VDB CSV",
-                    data=out_bytes,
-                    file_name=out_name,
-                    mime="text/csv",
-                )
+                st.download_button("⬇️ Download VDB CSV", data=out_bytes, file_name=out_name, mime="text/csv")
             except Exception as e:
                 st.error(f"VDB conversion failed: {e}")
 
     with c2:
         st.markdown("#### Export mapping JSON")
         mapping_json = json.dumps({"output_cols": output_cols, "mapping": mapping}, indent=2)
-        st.download_button(
-            "Download mapping JSON",
-            data=mapping_json.encode("utf-8"),
-            file_name="vdb_mapping.json",
-            mime="application/json",
-        )
+        st.download_button("Download mapping JSON", data=mapping_json.encode("utf-8"), file_name="vdb_mapping.json", mime="application/json")
 
     with c3:
         st.markdown("#### Import mapping JSON")
