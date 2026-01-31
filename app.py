@@ -1,4 +1,5 @@
 # app.py
+# One Streamlit app: Convert inventory CSV to (1) Shopify format OR (2) Your internal VDB format
 # Run: streamlit run app.py
 
 import io
@@ -49,7 +50,69 @@ def normalize_metal_for_tag(metal: str) -> str:
     m = re.sub(r"\b(\d{2})\s*K\b", r"\1 K", m, flags=re.IGNORECASE)
     return m
 
-# --- category tag cleanup ---
+# =========================================================
+# Styles (from SAME file)
+# =========================================================
+STYLE_COLS = ["Style", "Style1", "Style2", "Style3"]
+
+def extract_styles_from_row(row) -> list[str]:
+    styles = []
+    for c in STYLE_COLS:
+        v = row.get(c)
+        if isinstance(v, str) and v.strip():
+            styles.append(v.strip())
+
+    # de-dupe (case-insensitive) keep order
+    out = []
+    seen = set()
+    for s in styles:
+        k = s.lower()
+        if k not in seen:
+            out.append(s)
+            seen.add(k)
+    return out
+
+def style_multiline(styles: list[str]):
+    return "\n".join(styles) if styles else np.nan
+
+# =========================================================
+# Details section dynamic fields (NEW)
+# =========================================================
+DETAILS_LABEL_OVERRIDES_DEFAULT = {
+    "Side Clarity": "Side Stone Clarity",
+    "Side Color": "Side Stone Color",
+}
+
+def default_details_candidates(df: pd.DataFrame) -> list[str]:
+    preferred = [
+        "Side Clarity",
+        "Side Color",
+        "Jewelry Type",
+        "Jewelry Classification",
+        "Shape",
+        "Weight",
+        "Customizable",
+    ]
+    return [c for c in preferred if c in df.columns]
+
+def build_details_html_from_fields(master_row, selected_fields: list[str], label_overrides: dict) -> str:
+    lines = []
+    for col in selected_fields:
+        val = master_row.get(col, np.nan)
+        if pd.isna(val):
+            continue
+        if isinstance(val, str) and not val.strip():
+            continue
+
+        label = label_overrides.get(col, col)
+        safe_val = str(val).strip()
+        lines.append(f"<p><strong>{label}</strong> - {safe_val}</p>")
+
+    return "".join(lines)
+
+# =========================================================
+# Category tag cleanup (prevents Rings+Necklaces mix)
+# =========================================================
 CATEGORY_TAGS = {
     "ring","rings","engagement ring","engagement rings",
     "necklace","necklaces",
@@ -79,31 +142,7 @@ def type_to_allowed_categories(prod_type: str):
     return allowed
 
 # =========================================================
-# Styles from SAME file (NEW)
-# =========================================================
-STYLE_COLS = ["Style", "Style1", "Style2", "Style3"]
-
-def extract_styles_from_row(row) -> list[str]:
-    styles = []
-    for c in STYLE_COLS:
-        v = row.get(c)
-        if isinstance(v, str) and v.strip():
-            styles.append(v.strip())
-    # de-dupe keep order
-    out = []
-    seen = set()
-    for s in styles:
-        k = s.lower()
-        if k not in seen:
-            out.append(s)
-            seen.add(k)
-    return out
-
-def style_multiline(styles: list[str]):
-    return "\n".join(styles) if styles else np.nan
-
-# =========================================================
-# Shopify output builder
+# Shopify converter (updated)
 # =========================================================
 def pick_type(master_row):
     jc = master_row.get("Jewelry Classification")
@@ -114,42 +153,44 @@ def pick_type(master_row):
         return jt.strip()
     return "Jewelry"
 
-def build_body_html(master_row, styles: list[str]):
+# USER EDITED VERSION (kept exactly)
+def build_body_html(master_row, styles: list[str], selected_detail_fields: list[str], label_overrides: dict):
     desc = master_row.get("Description")
     desc_txt = str(desc).strip() if isinstance(desc, str) and desc.strip() else ""
 
-    side_clarity = master_row.get("Side Clarity")
-    side_color = master_row.get("Side Color")
+    details_lines = []
 
-    details = []
-
-    # styles in Details (only if present)
+    # styles (only if present)
     for s in styles:
-        details.append(f"<p><strong>Style</strong> - {s}</p>")
+        if isinstance(s, str) and s.strip():
+            details_lines.append(f"<p><strong>Style</strong> - {s.strip()}</p>")
 
-    if isinstance(side_clarity, str) and side_clarity.strip():
-        details.append(f"<p><strong>Side Stone Clarity</strong> - {side_clarity.strip()}</p>")
+    # selected extra fields
+    details_lines.append(
+        build_details_html_from_fields(master_row, selected_detail_fields, label_overrides)
+    )
 
-    if isinstance(side_color, str) and side_color.strip():
-        details.append(f"<p><strong>Side Stone Color</strong> - {side_color.strip()}</p>")
+    # flatten
+    details_html = "".join([x for x in details_lines if x])
 
     out = []
     if desc_txt:
         out.append(f"<p>{desc_txt}</p>")
-    if details:
-        out.append("<hr><h3>Details</h3>" + "".join(details))
+
+    if details_html.strip():
+        out.append("<hr><h3>Details</h3>" + details_html)
 
     return "".join(out) if out else np.nan
 
 def build_tags(master_row, prod_type: str, styles: list[str], item_location="United States"):
     tags = []
 
-    # keep existing tags in file
+    # keep existing tags from input
     orig = master_row.get("Tags")
     if isinstance(orig, str) and orig.strip():
         tags.extend([t.strip() for t in orig.split(",") if t.strip()])
 
-    # --- remove WRONG category tags based on Type ---
+    # remove WRONG category tags based on Type
     allowed = type_to_allowed_categories(prod_type)
     cleaned = []
     for t in tags:
@@ -159,20 +200,22 @@ def build_tags(master_row, prod_type: str, styles: list[str], item_location="Uni
         cleaned.append(t)
     tags = cleaned
 
-    # --- add correct category tags (so collections work) ---
+    # add correct category tags
     for cat in sorted(allowed):
         if not any(x.lower().strip() == cat for x in tags):
             tags.append(cat.title())
 
-    # ensure standard tags
+    # ensure item location
     if not any(t.lower().startswith("item location_") for t in tags):
         tags.append(f"Item Location_{item_location}")
 
+    # ensure metal tag exists
     metal = master_row.get("Metal")
     if isinstance(metal, str) and metal.strip():
         if not any(t.lower().startswith("metal_") for t in tags):
             tags.append(f"Metal_{normalize_metal_for_tag(metal)}")
 
+    # side stone tags
     sc = master_row.get("Side Clarity")
     if isinstance(sc, str) and sc.strip():
         if not any(t.lower().startswith("side stone clarity_") for t in tags):
@@ -183,6 +226,7 @@ def build_tags(master_row, prod_type: str, styles: list[str], item_location="Uni
         if not any(t.lower().startswith("side stone color_") for t in tags):
             tags.append(f"Side Stone Color_{scol.strip()}")
 
+    # type tags (kept)
     jt = master_row.get("Jewelry Type")
     if isinstance(jt, str) and jt.strip():
         tags.append(f"Type_{jt.strip()}")
@@ -191,7 +235,7 @@ def build_tags(master_row, prod_type: str, styles: list[str], item_location="Uni
     if isinstance(jc, str) and jc.strip():
         tags.append(f"Type_{jc.strip()}")
 
-    # add style tags only if present in file
+    # add styles into tags only if present
     for s in styles:
         if not any(t.lower().strip() == s.lower() for t in tags):
             tags.append(s)
@@ -200,7 +244,7 @@ def build_tags(master_row, prod_type: str, styles: list[str], item_location="Uni
     if "VDBJL" not in {t.upper() for t in tags}:
         tags.append("VDBJL")
 
-    # de-dupe (case-insensitive) keep order
+    # de-dupe case-insensitive preserve order
     out = []
     seen = set()
     for t in tags:
@@ -211,8 +255,13 @@ def build_tags(master_row, prod_type: str, styles: list[str], item_location="Uni
 
     return ", ".join(out) if out else np.nan
 
-def to_shopify_df(df: pd.DataFrame, vendor_name: str, item_location: str = "United States") -> pd.DataFrame:
-    # minimal Shopify columns (your exact base + Style metafield)
+def to_shopify_df(
+    df: pd.DataFrame,
+    vendor_name: str,
+    item_location: str = "United States",
+    selected_detail_fields: list[str] | None = None,
+    label_overrides: dict | None = None,
+) -> pd.DataFrame:
     shopify_cols = [
         "Handle","Title","Body (HTML)","Vendor","Product Category","Type","Tags","Published",
         "Option1 Name","Option1 Value","Option1 Linked To",
@@ -231,7 +280,10 @@ def to_shopify_df(df: pd.DataFrame, vendor_name: str, item_location: str = "Unit
         "Variant Image","Variant Weight Unit","Variant Tax Code","Cost per item","Status",
     ]
 
-    required = ["Master Stock Number", "Stock Number", "Metal", "Image URL 1"]
+    selected_detail_fields = selected_detail_fields or []
+    label_overrides = label_overrides or {}
+
+    required = ["Master Stock Number", "Stock Number", "Image URL 1"]
     missing = [c for c in required if c not in df.columns]
     if missing:
         raise ValueError(f"Missing required columns: {missing}")
@@ -252,11 +304,10 @@ def to_shopify_df(df: pd.DataFrame, vendor_name: str, item_location: str = "Unit
         if len(variants) == 0:
             variants = pd.DataFrame([master])
 
-        # keep first SKU row as the “main” row
         variants = variants.drop_duplicates(subset=["Stock Number"], keep="first").reset_index(drop=True)
         first_variant = variants.iloc[0]
 
-        # remove product if no valid primary image
+        # drop product if invalid primary image
         if not is_valid_image(first_variant.get("Image URL 1")):
             continue
 
@@ -264,11 +315,15 @@ def to_shopify_df(df: pd.DataFrame, vendor_name: str, item_location: str = "Unit
         handle = slugify(title)
 
         prod_type = pick_type(master)
-        styles = extract_styles_from_row(master)  # NEW: from same file
-        tags = build_tags(master, prod_type=prod_type, styles=styles, item_location=item_location)
-        body_html = build_body_html(master, styles)
+        styles = extract_styles_from_row(master)
 
+        tags = build_tags(master, prod_type=prod_type, styles=styles, item_location=item_location)
+        body_html = build_body_html(master, styles, selected_detail_fields, label_overrides)
+
+        # Option1 Metal filter
         metal = master.get("Metal")
+        if not (isinstance(metal, str) and metal.strip()):
+            metal = first_variant.get("Metal")
         metal_option = normalize_metal_for_option(metal) if isinstance(metal, str) and metal.strip() else np.nan
 
         # MAIN ROW
@@ -281,7 +336,6 @@ def to_shopify_df(df: pd.DataFrame, vendor_name: str, item_location: str = "Unit
         out["Tags"] = tags
         out["Published"] = True
 
-        # Metal filter option
         out["Option1 Name"] = "Metal Type"
         out["Option1 Value"] = metal_option
 
@@ -295,11 +349,10 @@ def to_shopify_df(df: pd.DataFrame, vendor_name: str, item_location: str = "Unit
         price = first_variant.get("Price")
         out["Variant Price"] = price
         out["Cost per item"] = price
+
         out["Variant Requires Shipping"] = True
         out["Variant Taxable"] = True
         out["Variant Weight Unit"] = "lb"
-        out["Gift Card"] = False
-        out["Status"] = "active"
 
         img1 = first_variant.get("Image URL 1")
         out["Image Src"] = img1
@@ -307,12 +360,15 @@ def to_shopify_df(df: pd.DataFrame, vendor_name: str, item_location: str = "Unit
         out["Image Position"] = 1
         out["Image Alt Text"] = handle
 
-        # Style metafield ONLY if present in file
+        out["Gift Card"] = False
+        out["Status"] = "active"
+
+        # Style metafield (multiline) only if present
         out["Style (product.metafields.custom.style)"] = style_multiline(styles)
 
         rows_out.append(out)
 
-        # extra images as additional rows
+        # extra images (2-4) as separate rows
         pos = 2
         for col in ["Image URL 2", "Image URL 3", "Image URL 4"]:
             u = first_variant.get(col)
@@ -328,11 +384,11 @@ def to_shopify_df(df: pd.DataFrame, vendor_name: str, item_location: str = "Unit
     return pd.DataFrame(rows_out, columns=shopify_cols)
 
 # =========================================================
-# VDB internal format converter (unchanged)
+# VDB internal format converter (customizable mapping)
 # =========================================================
 DEFAULT_VDB_OUTPUT_COLS = [
-    "master_stock_number","stock_number","short_title","jewelry_type","metal","diamond_spread","price",
-    "image_url_1","side_color","side_clarity","shape","weight","customizable","vendor_name",
+    "master_stock_number","stock_number","short_title","jewelry_type","metal","diamond_spread",
+    "price","image_url_1","side_color","side_clarity","shape","weight","customizable","vendor_name",
 ]
 
 DEFAULT_VDB_MAPPING = {
@@ -398,10 +454,46 @@ if not vendor_name or not vendor_name.strip():
     st.warning("Please enter a Vendor Name in the sidebar.")
     st.stop()
 
+# -----------------------------
+# Shopify Mode
+# -----------------------------
 if output_mode == "Shopify format":
+    st.subheader("Details Section Configuration")
+
+    exclude_cols = {
+        "Description", "Tags", "Tags.1",
+        "Image URL 1", "Image URL 2", "Image URL 3", "Image URL 4",
+        "Price", "Stock Number", "Master Stock Number",
+    }
+    candidate_fields = [c for c in df_in.columns if c not in exclude_cols]
+
+    default_selected = default_details_candidates(df_in)
+
+    selected_detail_fields = st.multiselect(
+        "Select fields to show in Details section (Body HTML)",
+        options=candidate_fields,
+        default=default_selected,
+    )
+
+    st.caption("Optional: Rename labels shown in Details (leave blank to keep original column name).")
+    label_overrides = dict(DETAILS_LABEL_OVERRIDES_DEFAULT)
+
+    with st.expander("Rename Details labels"):
+        for col in selected_detail_fields:
+            default_label = DETAILS_LABEL_OVERRIDES_DEFAULT.get(col, col)
+            new_label = st.text_input(f"Label for: {col}", value=default_label, key=f"lbl_{col}")
+            if new_label.strip() and new_label.strip() != col:
+                label_overrides[col] = new_label.strip()
+
     if st.button("Convert", type="primary"):
         try:
-            out_df = to_shopify_df(df_in, vendor_name=vendor_name.strip(), item_location=item_location.strip() or "United States")
+            out_df = to_shopify_df(
+                df_in,
+                vendor_name=vendor_name.strip(),
+                item_location=item_location.strip() or "United States",
+                selected_detail_fields=selected_detail_fields,
+                label_overrides=label_overrides,
+            )
             out_bytes = df_to_csv_bytes(out_df)
 
             st.success(f"✅ Shopify CSV generated: {len(out_df):,} rows.")
@@ -411,10 +503,18 @@ if output_mode == "Shopify format":
             base_name = uploaded_file.name.rsplit(".", 1)[0]
             out_name = f"{base_name}_SHOPIFY.csv"
 
-            st.download_button("⬇️ Download Shopify CSV", data=out_bytes, file_name=out_name, mime="text/csv")
+            st.download_button(
+                "⬇️ Download Shopify CSV",
+                data=out_bytes,
+                file_name=out_name,
+                mime="text/csv",
+            )
         except Exception as e:
             st.error(f"Conversion failed: {e}")
 
+# -----------------------------
+# VDB Mode
+# -----------------------------
 else:
     st.subheader("VDB Format Configuration")
 
@@ -422,7 +522,11 @@ else:
     selectable_cols = ["__BLANK__", "__STATIC_VENDOR__"] + cols
 
     st.markdown("### Output columns (your internal schema)")
-    out_cols_text = st.text_area("One column per line", value="\n".join(DEFAULT_VDB_OUTPUT_COLS), height=220)
+    out_cols_text = st.text_area(
+        "One column per line",
+        value="\n".join(DEFAULT_VDB_OUTPUT_COLS),
+        height=220,
+    )
     output_cols = [c.strip() for c in out_cols_text.splitlines() if c.strip()]
 
     st.markdown("### Mapping (output → input)")
@@ -447,7 +551,12 @@ else:
     with c1:
         if st.button("Convert", type="primary"):
             try:
-                out_df = to_vdb_df(df_in, vendor_name=vendor_name.strip(), output_cols=output_cols, mapping=mapping)
+                out_df = to_vdb_df(
+                    df_in,
+                    vendor_name=vendor_name.strip(),
+                    output_cols=output_cols,
+                    mapping=mapping,
+                )
                 out_bytes = df_to_csv_bytes(out_df)
 
                 st.success(f"✅ VDB CSV generated: {len(out_df):,} rows.")
@@ -457,14 +566,24 @@ else:
                 base_name = uploaded_file.name.rsplit(".", 1)[0]
                 out_name = f"{base_name}_VDB_FORMAT.csv"
 
-                st.download_button("⬇️ Download VDB CSV", data=out_bytes, file_name=out_name, mime="text/csv")
+                st.download_button(
+                    "⬇️ Download VDB CSV",
+                    data=out_bytes,
+                    file_name=out_name,
+                    mime="text/csv",
+                )
             except Exception as e:
                 st.error(f"VDB conversion failed: {e}")
 
     with c2:
         st.markdown("#### Export mapping JSON")
         mapping_json = json.dumps({"output_cols": output_cols, "mapping": mapping}, indent=2)
-        st.download_button("Download mapping JSON", data=mapping_json.encode("utf-8"), file_name="vdb_mapping.json", mime="application/json")
+        st.download_button(
+            "Download mapping JSON",
+            data=mapping_json.encode("utf-8"),
+            file_name="vdb_mapping.json",
+            mime="application/json",
+        )
 
     with c3:
         st.markdown("#### Import mapping JSON")
