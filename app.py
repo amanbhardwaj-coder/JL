@@ -153,7 +153,7 @@ def pick_type(master_row):
         return jt.strip()
     return "Jewelry"
 
-# USER EDITED VERSION (kept exactly)
+# USER EDITED VERSION (kept)
 def build_body_html(master_row, styles: list[str], selected_detail_fields: list[str], label_overrides: dict):
     desc = master_row.get("Description")
     desc_txt = str(desc).strip() if isinstance(desc, str) and desc.strip() else ""
@@ -170,7 +170,6 @@ def build_body_html(master_row, styles: list[str], selected_detail_fields: list[
         build_details_html_from_fields(master_row, selected_detail_fields, label_overrides)
     )
 
-    # flatten
     details_html = "".join([x for x in details_lines if x])
 
     out = []
@@ -182,7 +181,119 @@ def build_body_html(master_row, styles: list[str], selected_detail_fields: list[
 
     return "".join(out) if out else np.nan
 
-def build_tags(master_row, prod_type: str, styles: list[str], item_location="United States"):
+# =========================================================
+# Dynamic Option Inference (GLOBAL)
+# - Uses per-variant "Config Field 10" (values 1/2/3/4)
+# - Ignores "Available Config Field 10" (lists like 1#2#3#4)
+# =========================================================
+OPTION_EXCLUDE_COLS = {
+    # identifiers / grouping
+    "Master Stock Number", "Stock Number", "is_master_product",
+
+    # pricing/inventory-ish
+    "Price", "Total Sales Price", "Cost per item",
+
+    # content/tags
+    "Description", "Tags", "Tags.1",
+
+    # images
+    "Image URL 1", "Image URL 2", "Image URL 3", "Image URL 4",
+
+    # known shopify-ish
+    "Handle", "Title", "Body (HTML)", "Vendor", "Type", "Published", "Status",
+}
+
+# Prefer these columns (if they vary within the group)
+OPTION_PRIORITY = [
+    "Metal Type", "Metal",
+    "Shape",
+
+    # IMPORTANT: per-variant config fields (selected value per SKU)
+    "Config Field 10", "Config Field 9", "Config Field 8", "Config Field 7",
+    "Config Field 6", "Config Field 5", "Config Field 4", "Config Field 3",
+    "Config Field 2", "Config Field 1",
+
+    "Ring Size", "Size",
+    "Length", "Width",
+    "Color",
+    "Side Color", "Side Clarity",
+    "Carat", "Weight",
+    "Jewelry Type", "Jewelry Classification",
+]
+
+# Optional: rename option labels in Shopify output (values still come from original cols)
+OPTION_LABEL_OVERRIDES = {
+    # Example:
+    # "Config Field 10": "Setting Size",
+}
+
+def _clean_option_value(v):
+    if pd.isna(v):
+        return np.nan
+    if isinstance(v, str):
+        s = v.strip()
+        return s if s else np.nan
+    s = str(v).strip()
+    return s if s else np.nan
+
+def _looks_like_list_value(v: str) -> bool:
+    """
+    Treat values like '1#2#3#4' or 'a|b|c' as 'available list', not a real option value.
+    """
+    if not isinstance(v, str):
+        return False
+    s = v.strip()
+    if not s:
+        return False
+    if "#" in s or "|" in s or ";" in s:
+        return True
+    if s.count(",") >= 3:
+        return True
+    return False
+
+def infer_option_columns_for_group(group: pd.DataFrame, max_options: int = 3) -> list[str]:
+    candidates = []
+
+    for col in group.columns:
+        if col in OPTION_EXCLUDE_COLS or col in STYLE_COLS:
+            continue
+
+        col_l = col.lower().strip()
+
+        # Hard ignore "Available ..." columns globally
+        if col_l.startswith("available ") or "available config" in col_l:
+            continue
+
+        series = group[col].apply(_clean_option_value)
+        non_null = series.dropna()
+        if non_null.empty:
+            continue
+
+        # If most sample values look like lists, skip (this catches list-y columns)
+        sample = non_null.astype(str).head(25).tolist()
+        if sample and sum(_looks_like_list_value(x) for x in sample) >= max(3, int(0.6 * len(sample))):
+            continue
+
+        uniq_count = non_null.nunique()
+        if uniq_count <= 1:
+            continue
+
+        # reject very high-cardinality columns (usually free text)
+        if uniq_count > max(30, int(len(group) * 0.8)):
+            continue
+
+        candidates.append(col)
+
+    prioritized = [c for c in OPTION_PRIORITY if c in candidates]
+    remaining = [c for c in candidates if c not in set(prioritized)]
+    remaining.sort(key=lambda c: (group[c].apply(_clean_option_value).dropna().nunique(), c.lower()))
+
+    return (prioritized + remaining)[:max_options]
+
+# =========================================================
+# Tags builder (metal tag only if consistent across variants)
+# =========================================================
+def build_tags(master_row, prod_type: str, styles: list[str], item_location="United States", variants: pd.DataFrame | None = None):
     tags = []
 
     # keep existing tags from input
@@ -209,13 +320,31 @@ def build_tags(master_row, prod_type: str, styles: list[str], item_location="Uni
     if not any(t.lower().startswith("item location_") for t in tags):
         tags.append(f"Item Location_{item_location}")
 
-    # ensure metal tag exists (supports both Metal and Metal Type)
-    metal = master_row.get("Metal")
-    if not (isinstance(metal, str) and metal.strip()):
-        metal = master_row.get("Metal Type")
-    if isinstance(metal, str) and metal.strip():
+    # METAL TAG ONLY IF CONSISTENT ACROSS VARIANTS
+    metal_value = None
+    if variants is not None:
+        if "Metal Type" in variants.columns:
+            metal_series = variants["Metal Type"].apply(_clean_option_value)
+        elif "Metal" in variants.columns:
+            metal_series = variants["Metal"].apply(_clean_option_value)
+        else:
+            metal_series = None
+
+        if metal_series is not None:
+            uniq = metal_series.dropna().unique().tolist()
+            if len(uniq) == 1:
+                metal_value = uniq[0]
+
+    if metal_value is None:
+        metal = master_row.get("Metal")
+        if not (isinstance(metal, str) and metal.strip()):
+            metal = master_row.get("Metal Type")
+        if isinstance(metal, str) and metal.strip():
+            metal_value = metal.strip()
+
+    if metal_value:
         if not any(t.lower().startswith("metal_") for t in tags):
-            tags.append(f"Metal_{normalize_metal_for_tag(metal)}")
+            tags.append(f"Metal_{normalize_metal_for_tag(metal_value)}")
 
     # side stone tags
     sc = master_row.get("Side Clarity")
@@ -257,82 +386,9 @@ def build_tags(master_row, prod_type: str, styles: list[str], item_location="Uni
 
     return ", ".join(out) if out else np.nan
 
-# ---------------------------
-# Dynamic Option Inference (GLOBAL)
-# ---------------------------
-OPTION_EXCLUDE_COLS = {
-    # identifiers / grouping
-    "Master Stock Number", "Stock Number", "is_master_product",
-
-    # pricing/inventory-ish
-    "Price", "Total Sales Price", "Cost per item",
-
-    # content/tags
-    "Description", "Tags", "Tags.1",
-
-    # images
-    "Image URL 1", "Image URL 2", "Image URL 3", "Image URL 4",
-
-    # known shopify-ish
-    "Handle", "Title", "Body (HTML)", "Vendor", "Type", "Published", "Status",
-}
-
-# Columns you *prefer* to use as options if they vary
-OPTION_PRIORITY = [
-    "Metal Type", "Metal",
-    "Shape",
-    "Ring Size", "Size",
-    "Length",
-    "Width",
-    "Color",
-    "Side Color",
-    "Side Clarity",
-    "Carat", "Weight",
-    "Jewelry Type", "Jewelry Classification",
-]
-
-def _clean_option_value(v):
-    if pd.isna(v):
-        return np.nan
-    if isinstance(v, str):
-        s = v.strip()
-        return s if s else np.nan
-    s = str(v).strip()
-    return s if s else np.nan
-
-def infer_option_columns_for_group(group: pd.DataFrame, max_options: int = 3) -> list[str]:
-    """
-    Finds columns that vary inside the group and are good candidates for Shopify options.
-    Returns up to max_options columns.
-    """
-    candidates = []
-    for col in group.columns:
-        if col in OPTION_EXCLUDE_COLS:
-            continue
-        if col in STYLE_COLS:
-            continue
-
-        series = group[col].apply(_clean_option_value)
-        uniq = [x for x in series.dropna().unique()]
-        if len(uniq) <= 1:
-            continue
-
-        # Heuristic: avoid very high-cardinality columns (usually junk/free-text)
-        if len(uniq) > max(30, int(len(group) * 0.8)):
-            continue
-
-        candidates.append(col)
-
-    # Priority-first selection
-    prioritized = [c for c in OPTION_PRIORITY if c in candidates]
-    remaining = [c for c in candidates if c not in set(prioritized)]
-
-    # then by: lower cardinality first (more "option-like"), then name
-    remaining.sort(key=lambda c: (group[c].apply(_clean_option_value).dropna().nunique(), c.lower()))
-
-    chosen = (prioritized + remaining)[:max_options]
-    return chosen
-
+# =========================================================
+# Main Shopify conversion (supports true variants)
+# =========================================================
 def to_shopify_df(
     df: pd.DataFrame,
     vendor_name: str,
@@ -341,7 +397,6 @@ def to_shopify_df(
     label_overrides: dict | None = None,
     option_mode: str = "Auto",
     manual_option_cols: list[str] | None = None,
-    prefer_handle_from: str = "Master Stock Number",
 ) -> pd.DataFrame:
     shopify_cols = [
         "Handle","Title","Body (HTML)","Vendor","Product Category","Type","Tags","Published",
@@ -397,28 +452,25 @@ def to_shopify_df(
         if not valid_img_mask.any():
             continue
 
-        # product identity
-        if prefer_handle_from in df.columns:
-            seed = str(master.get(prefer_handle_from)).strip()
-        else:
-            seed = str(master.get("Master Stock Number")).strip()
-
-        title = seed if seed else str(msn).strip()
+        # title/handle
+        seed = str(master.get("Master Stock Number")).strip()
+        title = seed if (isinstance(seed, str) and seed.strip()) else str(msn).strip()
         handle = slugify(title)
 
         prod_type = pick_type(master)
         styles = extract_styles_from_row(master)
-        tags = build_tags(master, prod_type=prod_type, styles=styles, item_location=item_location)
         body_html = build_body_html(master, styles, selected_detail_fields, label_overrides)
 
-        # decide option columns (global)
+        # decide option columns
         if option_mode == "Manual" and manual_option_cols:
             option_cols = [c for c in manual_option_cols if c in variants.columns][:3]
         else:
             option_cols = infer_option_columns_for_group(variants, max_options=3)
 
-        # Shopify needs option names too; we just use column names as labels (global)
-        option_names = option_cols[:]
+        option_names = [OPTION_LABEL_OVERRIDES.get(c, c) for c in option_cols]
+
+        # tags (metal tag only if consistent across variants)
+        tags = build_tags(master, prod_type=prod_type, styles=styles, item_location=item_location, variants=variants)
 
         image_pos = 1
 
@@ -426,7 +478,7 @@ def to_shopify_df(
             out = {c: np.nan for c in shopify_cols}
             out["Handle"] = handle
 
-            # product-level fields only on first row (best practice for Shopify import)
+            # product-level fields only on first row
             if i == 0:
                 out["Title"] = title
                 out["Body (HTML)"] = body_html
@@ -442,14 +494,16 @@ def to_shopify_df(
             for idx in range(3):
                 name_col = f"Option{idx+1} Name"
                 value_col = f"Option{idx+1} Value"
-                if idx < len(option_cols):
-                    col = option_cols[idx]
-                    out[name_col] = option_names[idx]
-                    v = _clean_option_value(var_row.get(col, np.nan))
 
-                    # small metal normalization (optional)
+                if idx < len(option_cols):
+                    src_col = option_cols[idx]
+                    out[name_col] = option_names[idx]
+                    v = _clean_option_value(var_row.get(src_col, np.nan))
+
+                    # normalize metal display if this option is metal
                     if isinstance(v, str) and option_names[idx].lower() in {"metal", "metal type"}:
                         v = normalize_metal_for_option(v)
+
                     out[value_col] = v
                 else:
                     out[name_col] = np.nan
@@ -471,7 +525,7 @@ def to_shopify_df(
             out["Variant Price"] = price
             out["Cost per item"] = price
 
-            # images (primary only per variant; Shopify will accept one per row)
+            # images (primary only per variant)
             img1 = var_row.get("Image URL 1")
             if not is_valid_image(img1):
                 img1 = variants.loc[valid_img_mask].iloc[0].get("Image URL 1")
@@ -599,16 +653,16 @@ if output_mode == "Shopify format":
         manual_option_cols = st.multiselect(
             "Pick up to 3 columns to use as Shopify options (Option1/2/3)",
             options=option_candidates,
-            default=[c for c in OPTION_PRIORITY if c in option_candidates][:2],
+            default=[c for c in OPTION_PRIORITY if c in option_candidates][:3],
             max_selections=3,
         )
 
-    with st.expander("How Auto mode works"):
+    with st.expander("Auto mode rules (important)"):
         st.write(
-            "- For each Master Stock Number, Auto finds columns that actually vary across its SKUs.\n"
-            "- It ignores SKU/price/images/description/tags and other non-option columns.\n"
-            "- It prefers common jewelry options (Metal, Shape, Size) if they vary.\n"
-            "- It outputs up to 3 options (Shopify supports 3)."
+            "- Auto selects columns that vary across SKUs for each Master Stock Number.\n"
+            "- It ignores columns starting with 'Available ...' (like 'Available Config Field 10').\n"
+            "- It prefers per-variant 'Config Field X' (values 1/2/3/4) over 'Available ...' list columns.\n"
+            "- Shopify supports max 3 option columns (Option1/2/3)."
         )
 
     if st.button("Convert", type="primary"):
