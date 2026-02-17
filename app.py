@@ -76,7 +76,7 @@ def style_multiline(styles: list[str]):
     return "\n".join(styles) if styles else np.nan
 
 # =========================================================
-# Details section dynamic fields (NEW)
+# Details section dynamic fields
 # =========================================================
 DETAILS_LABEL_OVERRIDES_DEFAULT = {
     "Side Clarity": "Side Stone Clarity",
@@ -142,7 +142,7 @@ def type_to_allowed_categories(prod_type: str):
     return allowed
 
 # =========================================================
-# Shopify converter (updated)
+# Shopify converter
 # =========================================================
 def pick_type(master_row):
     jc = master_row.get("Jewelry Classification")
@@ -209,8 +209,10 @@ def build_tags(master_row, prod_type: str, styles: list[str], item_location="Uni
     if not any(t.lower().startswith("item location_") for t in tags):
         tags.append(f"Item Location_{item_location}")
 
-    # ensure metal tag exists
+    # ensure metal tag exists (supports both Metal and Metal Type)
     metal = master_row.get("Metal")
+    if not (isinstance(metal, str) and metal.strip()):
+        metal = master_row.get("Metal Type")
     if isinstance(metal, str) and metal.strip():
         if not any(t.lower().startswith("metal_") for t in tags):
             tags.append(f"Metal_{normalize_metal_for_tag(metal)}")
@@ -226,7 +228,7 @@ def build_tags(master_row, prod_type: str, styles: list[str], item_location="Uni
         if not any(t.lower().startswith("side stone color_") for t in tags):
             tags.append(f"Side Stone Color_{scol.strip()}")
 
-    # type tags (kept)
+    # type tags
     jt = master_row.get("Jewelry Type")
     if isinstance(jt, str) and jt.strip():
         tags.append(f"Type_{jt.strip()}")
@@ -255,12 +257,91 @@ def build_tags(master_row, prod_type: str, styles: list[str], item_location="Uni
 
     return ", ".join(out) if out else np.nan
 
+# ---------------------------
+# Dynamic Option Inference (GLOBAL)
+# ---------------------------
+OPTION_EXCLUDE_COLS = {
+    # identifiers / grouping
+    "Master Stock Number", "Stock Number", "is_master_product",
+
+    # pricing/inventory-ish
+    "Price", "Total Sales Price", "Cost per item",
+
+    # content/tags
+    "Description", "Tags", "Tags.1",
+
+    # images
+    "Image URL 1", "Image URL 2", "Image URL 3", "Image URL 4",
+
+    # known shopify-ish
+    "Handle", "Title", "Body (HTML)", "Vendor", "Type", "Published", "Status",
+}
+
+# Columns you *prefer* to use as options if they vary
+OPTION_PRIORITY = [
+    "Metal Type", "Metal",
+    "Shape",
+    "Ring Size", "Size",
+    "Length",
+    "Width",
+    "Color",
+    "Side Color",
+    "Side Clarity",
+    "Carat", "Weight",
+    "Jewelry Type", "Jewelry Classification",
+]
+
+def _clean_option_value(v):
+    if pd.isna(v):
+        return np.nan
+    if isinstance(v, str):
+        s = v.strip()
+        return s if s else np.nan
+    s = str(v).strip()
+    return s if s else np.nan
+
+def infer_option_columns_for_group(group: pd.DataFrame, max_options: int = 3) -> list[str]:
+    """
+    Finds columns that vary inside the group and are good candidates for Shopify options.
+    Returns up to max_options columns.
+    """
+    candidates = []
+    for col in group.columns:
+        if col in OPTION_EXCLUDE_COLS:
+            continue
+        if col in STYLE_COLS:
+            continue
+
+        series = group[col].apply(_clean_option_value)
+        uniq = [x for x in series.dropna().unique()]
+        if len(uniq) <= 1:
+            continue
+
+        # Heuristic: avoid very high-cardinality columns (usually junk/free-text)
+        if len(uniq) > max(30, int(len(group) * 0.8)):
+            continue
+
+        candidates.append(col)
+
+    # Priority-first selection
+    prioritized = [c for c in OPTION_PRIORITY if c in candidates]
+    remaining = [c for c in candidates if c not in set(prioritized)]
+
+    # then by: lower cardinality first (more "option-like"), then name
+    remaining.sort(key=lambda c: (group[c].apply(_clean_option_value).dropna().nunique(), c.lower()))
+
+    chosen = (prioritized + remaining)[:max_options]
+    return chosen
+
 def to_shopify_df(
     df: pd.DataFrame,
     vendor_name: str,
     item_location: str = "United States",
     selected_detail_fields: list[str] | None = None,
     label_overrides: dict | None = None,
+    option_mode: str = "Auto",
+    manual_option_cols: list[str] | None = None,
+    prefer_handle_from: str = "Master Stock Number",
 ) -> pd.DataFrame:
     shopify_cols = [
         "Handle","Title","Body (HTML)","Vendor","Product Category","Type","Tags","Published",
@@ -282,104 +363,126 @@ def to_shopify_df(
 
     selected_detail_fields = selected_detail_fields or []
     label_overrides = label_overrides or {}
+    manual_option_cols = manual_option_cols or []
 
     required = ["Master Stock Number", "Stock Number", "Image URL 1"]
     missing = [c for c in required if c not in df.columns]
     if missing:
         raise ValueError(f"Missing required columns: {missing}")
 
+    # pick best price column available
+    price_col = "Price"
+    if "Total Sales Price" in df.columns:
+        price_col = "Total Sales Price"
+
     rows_out = []
 
     for msn, group in df.groupby("Master Stock Number", dropna=False):
         group = group.copy()
 
-        # master row
+        # master row for product-level fields
         if "is_master_product" in group.columns and group["is_master_product"].fillna(False).any():
             master = group.loc[group["is_master_product"].fillna(False)].iloc[0]
-            variants = group.loc[~group["is_master_product"].fillna(False)].copy()
         else:
             master = group.iloc[0]
-            variants = group.copy()
 
-        if len(variants) == 0:
-            variants = pd.DataFrame([master])
+        # variants = all unique SKUs
+        variants = (
+            group.drop_duplicates(subset=["Stock Number"], keep="first")
+                 .reset_index(drop=True)
+        )
 
-        variants = variants.drop_duplicates(subset=["Stock Number"], keep="first").reset_index(drop=True)
-        first_variant = variants.iloc[0]
-
-        # drop product if invalid primary image
-        if not is_valid_image(first_variant.get("Image URL 1")):
+        # must have at least one valid image across variants
+        valid_img_mask = variants["Image URL 1"].apply(is_valid_image)
+        if not valid_img_mask.any():
             continue
 
-        title = str(master.get("Master Stock Number")).strip()  # SKU as title
+        # product identity
+        if prefer_handle_from in df.columns:
+            seed = str(master.get(prefer_handle_from)).strip()
+        else:
+            seed = str(master.get("Master Stock Number")).strip()
+
+        title = seed if seed else str(msn).strip()
         handle = slugify(title)
 
         prod_type = pick_type(master)
         styles = extract_styles_from_row(master)
-
         tags = build_tags(master, prod_type=prod_type, styles=styles, item_location=item_location)
         body_html = build_body_html(master, styles, selected_detail_fields, label_overrides)
 
-        # Option1 Metal filter
-        metal = master.get("Metal")
-        if not (isinstance(metal, str) and metal.strip()):
-            metal = first_variant.get("Metal")
-        metal_option = normalize_metal_for_option(metal) if isinstance(metal, str) and metal.strip() else np.nan
+        # decide option columns (global)
+        if option_mode == "Manual" and manual_option_cols:
+            option_cols = [c for c in manual_option_cols if c in variants.columns][:3]
+        else:
+            option_cols = infer_option_columns_for_group(variants, max_options=3)
 
-        # MAIN ROW
-        out = {c: np.nan for c in shopify_cols}
-        out["Handle"] = handle
-        out["Title"] = title
-        out["Body (HTML)"] = body_html
-        out["Vendor"] = vendor_name
-        out["Type"] = prod_type
-        out["Tags"] = tags
-        out["Published"] = True
+        # Shopify needs option names too; we just use column names as labels (global)
+        option_names = option_cols[:]
 
-        out["Option1 Name"] = "Metal Type"
-        out["Option1 Value"] = metal_option
+        image_pos = 1
 
-        out["Variant SKU"] = str(first_variant.get("Stock Number")).strip()
-        out["Variant Grams"] = 0
-        out["Variant Inventory Tracker"] = "shopify"
-        out["Variant Inventory Qty"] = 1
-        out["Variant Inventory Policy"] = "deny"
-        out["Variant Fulfillment Service"] = "manual"
+        for i, (_, var_row) in enumerate(variants.iterrows()):
+            out = {c: np.nan for c in shopify_cols}
+            out["Handle"] = handle
 
-        price = first_variant.get("Price")
-        out["Variant Price"] = price
-        out["Cost per item"] = price
+            # product-level fields only on first row (best practice for Shopify import)
+            if i == 0:
+                out["Title"] = title
+                out["Body (HTML)"] = body_html
+                out["Vendor"] = vendor_name
+                out["Type"] = prod_type
+                out["Tags"] = tags
+                out["Published"] = True
+                out["Gift Card"] = False
+                out["Status"] = "active"
+                out["Style (product.metafields.custom.style)"] = style_multiline(styles)
 
-        out["Variant Requires Shipping"] = True
-        out["Variant Taxable"] = True
-        out["Variant Weight Unit"] = "lb"
+            # options per variant row
+            for idx in range(3):
+                name_col = f"Option{idx+1} Name"
+                value_col = f"Option{idx+1} Value"
+                if idx < len(option_cols):
+                    col = option_cols[idx]
+                    out[name_col] = option_names[idx]
+                    v = _clean_option_value(var_row.get(col, np.nan))
 
-        img1 = first_variant.get("Image URL 1")
-        out["Image Src"] = img1
-        out["Variant Image"] = img1
-        out["Image Position"] = 1
-        out["Image Alt Text"] = handle
+                    # small metal normalization (optional)
+                    if isinstance(v, str) and option_names[idx].lower() in {"metal", "metal type"}:
+                        v = normalize_metal_for_option(v)
+                    out[value_col] = v
+                else:
+                    out[name_col] = np.nan
+                    out[value_col] = np.nan
 
-        out["Gift Card"] = False
-        out["Status"] = "active"
+            # variant essentials
+            sku = str(var_row.get("Stock Number")).strip()
+            out["Variant SKU"] = sku
+            out["Variant Grams"] = 0
+            out["Variant Inventory Tracker"] = "shopify"
+            out["Variant Inventory Qty"] = 1
+            out["Variant Inventory Policy"] = "deny"
+            out["Variant Fulfillment Service"] = "manual"
+            out["Variant Requires Shipping"] = True
+            out["Variant Taxable"] = True
+            out["Variant Weight Unit"] = "lb"
 
-        # Style metafield (multiline) only if present
-        out["Style (product.metafields.custom.style)"] = style_multiline(styles)
+            price = var_row.get(price_col, np.nan)
+            out["Variant Price"] = price
+            out["Cost per item"] = price
 
-        rows_out.append(out)
+            # images (primary only per variant; Shopify will accept one per row)
+            img1 = var_row.get("Image URL 1")
+            if not is_valid_image(img1):
+                img1 = variants.loc[valid_img_mask].iloc[0].get("Image URL 1")
 
-        # extra images (2-4) as separate rows
-        pos = 2
-        for col in ["Image URL 2", "Image URL 3", "Image URL 4"]:
-            u = first_variant.get(col)
-            if is_valid_image(u):
-                rr = {c: np.nan for c in shopify_cols}
-                rr["Handle"] = handle
-                rr["Image Src"] = u
-                rr["Image Position"] = pos
-                rr["Image Alt Text"] = handle
-                rows_out.append(rr)
-                pos += 1
+            out["Image Src"] = img1
+            out["Variant Image"] = img1
+            out["Image Position"] = image_pos
+            out["Image Alt Text"] = handle
+            image_pos += 1
+
+            rows_out.append(out)
 
     return pd.DataFrame(rows_out, columns=shopify_cols)
 
@@ -463,7 +566,7 @@ if output_mode == "Shopify format":
     exclude_cols = {
         "Description", "Tags", "Tags.1",
         "Image URL 1", "Image URL 2", "Image URL 3", "Image URL 4",
-        "Price", "Stock Number", "Master Stock Number",
+        "Price", "Total Sales Price", "Stock Number", "Master Stock Number",
     }
     candidate_fields = [c for c in df_in.columns if c not in exclude_cols]
 
@@ -485,6 +588,29 @@ if output_mode == "Shopify format":
             if new_label.strip() and new_label.strip() != col:
                 label_overrides[col] = new_label.strip()
 
+    st.markdown("---")
+    st.subheader("Variant Options Configuration (GLOBAL)")
+
+    option_mode = st.radio("Options mode", ["Auto", "Manual"], index=0, horizontal=True)
+
+    manual_option_cols = []
+    if option_mode == "Manual":
+        option_candidates = [c for c in df_in.columns if c not in OPTION_EXCLUDE_COLS and c not in STYLE_COLS]
+        manual_option_cols = st.multiselect(
+            "Pick up to 3 columns to use as Shopify options (Option1/2/3)",
+            options=option_candidates,
+            default=[c for c in OPTION_PRIORITY if c in option_candidates][:2],
+            max_selections=3,
+        )
+
+    with st.expander("How Auto mode works"):
+        st.write(
+            "- For each Master Stock Number, Auto finds columns that actually vary across its SKUs.\n"
+            "- It ignores SKU/price/images/description/tags and other non-option columns.\n"
+            "- It prefers common jewelry options (Metal, Shape, Size) if they vary.\n"
+            "- It outputs up to 3 options (Shopify supports 3)."
+        )
+
     if st.button("Convert", type="primary"):
         try:
             out_df = to_shopify_df(
@@ -493,12 +619,14 @@ if output_mode == "Shopify format":
                 item_location=item_location.strip() or "United States",
                 selected_detail_fields=selected_detail_fields,
                 label_overrides=label_overrides,
+                option_mode=option_mode,
+                manual_option_cols=manual_option_cols,
             )
             out_bytes = df_to_csv_bytes(out_df)
 
             st.success(f"✅ Shopify CSV generated: {len(out_df):,} rows.")
             st.subheader("Output Preview (Shopify)")
-            st.dataframe(out_df.head(25), use_container_width=True)
+            st.dataframe(out_df.head(50), use_container_width=True)
 
             base_name = uploaded_file.name.rsplit(".", 1)[0]
             out_name = f"{base_name}_SHOPIFY.csv"
@@ -561,7 +689,7 @@ else:
 
                 st.success(f"✅ VDB CSV generated: {len(out_df):,} rows.")
                 st.subheader("Output Preview (VDB)")
-                st.dataframe(out_df.head(25), use_container_width=True)
+                st.dataframe(out_df.head(50), use_container_width=True)
 
                 base_name = uploaded_file.name.rsplit(".", 1)[0]
                 out_name = f"{base_name}_VDB_FORMAT.csv"
